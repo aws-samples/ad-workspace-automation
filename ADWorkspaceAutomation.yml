@@ -1,0 +1,788 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'This CloudFormation template creates a solution to automate the registration of a Workspace Directory,Creates a maintenance task to perform AD actions, and manages Amazon WorkSpaces instance lifecycles according to the presence of users in an AD OU.'
+# Sample code, software libraries, command line tools, proofs of concept, templates, or other related technology are provided as AWS Content or Third-Party Content under the AWS Customer Agreement, or the relevant written agreement between you and AWS (whichever applies). You should not use this AWS Content or Third-Party Content in your production accounts, or on production or other critical data. You are responsible for testing, securing, and optimizing the AWS Content or Third-Party Content, such as sample code, as appropriate for production grade use based on your specific quality control practices and standards. Deploying AWS Content or Third-Party Content may incur AWS charges for creating or using AWS chargeable resources, such as running Amazon EC2 instances or using Amazon S3 storage. Refer to associated README for additional guidance and considerations.
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      -
+        Label:
+          default: "Directory Information"
+        Parameters:
+          - DirectoryID
+          - DomainOUPath
+          - wsADSecret
+      -
+        Label:
+          default: "Network Information"
+        Parameters:
+          - WorkspaceSubnetOne
+          - WorkspaceSubnetTwo
+      -
+        Label:
+          default: "Management Instance Information"
+        Parameters:
+          - AdInstanceID
+          - DriveLetter
+      -
+        Label:
+          default: "Workspace Information"
+        Parameters:
+          - WorkSpaceRoleChoice
+          - DirectoryRegistrationChoice
+          - BundleID
+      - 
+        Label:
+          default: "S3 Information"
+        Parameters:
+          - UsersBucketName
+
+Parameters:
+
+# S3 bucket unique name
+  UsersBucketName:
+    Type: String
+    Description: 'The name of S3 bucket to used store the CSV file containing the user list. Must be an unique name. (ie: ws-dr-bucket-080119)'
+    Default: ''
+
+# Domain joined instance ID
+  AdInstanceID:
+    Type: String
+    Description: 'The EC2 Instance ID of domain joined Windows Server. (ie: i-012a3b4c567d8e901)'
+    Default: ''
+
+# AD Connector or Microsoft AD directory ID
+  DirectoryID:
+    Type: String
+    Description: 'The ID of the AWS Directory Services component (ie: d-01234a567b).'
+    Default: ''
+
+# WorkSpaces bundle ID
+  BundleID:
+    Type: String
+    Description: 'The ID of the Amazon WorkSpaces Bundle (ie: wsb-abc0defgh).'
+    Default: ''
+
+# Windows drive for PS1 script
+  DriveLetter:
+    Type: String
+    Description: 'The drive on the AD controller where the maintenance task will run and use as temp space for downloading the csv file. (ie: C)'
+    Default: 'C'
+
+# Secrets Manager ARN for service account
+  wsADSecret:
+    Type: String
+    Description: 'The ARN of the Secrets Manager entry for the Active Directory Service Account'
+    Default: ''
+
+# Subnet 1 for Workspace Deployment
+  WorkspaceSubnetOne:
+    Type: String
+    Description: 'The first SubnetID for Workspace deployment'
+    Default: ''
+
+# Subnet 2 for Workspace Deployment
+  WorkspaceSubnetTwo:
+    Type: String
+    Description: 'The second SubnetID for Workspace deployment'
+    Default: ''
+
+# AD Root OU where WorkspaceUsers OU will be created
+  DomainOUPath:
+    Type: String
+    Description: 'The Active Directory DN where the WorkspaceUsers OU will be created (e.g. OU=company,Dc=corp,DC=example,DC=com)'
+    Default: ''
+
+# Choice to deploy workspaces_DefaultRole  
+  WorkSpaceRoleChoice:
+    Type: String
+    Default: false
+    AllowedValues: [true, false]
+    Description: 'Select true to create the workspaces_DefaultRole in this account.'
+
+#Choice to have directory registered with Workspaces 
+  DirectoryRegistrationChoice:
+    Type: String
+    Default: false
+    AllowedValues: [true, false]
+    Description: 'Select true to enable the Workspace to be registered with the Directory.'
+
+Conditions:
+  CreateWSDefaultRole: !Equals [true, !Ref WorkSpaceRoleChoice]
+  CreateDirectoryRegistration: !Equals [true, !Ref DirectoryRegistrationChoice]
+
+Resources:
+
+# Create AD Management Server Role
+  AdMgtServerRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore
+        #- !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonSSMDirectoryServiceAccess
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+                - ssm.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      RoleName: 'AD-Management-Role'
+
+# Create AD Management Server Policies
+  AdMgtServerPolicy:
+    Type: 'AWS::IAM::Policy'
+    Properties:
+      PolicyName: 'AD-Management-Policy'
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: PutObject
+            Effect: Allow
+            Action:
+              - 's3:GetObject'
+              - 's3:PutObject'
+              - 's3:PutObjectAcl'
+              - 's3:GetEncryptionConfiguration'
+              - 's3:Get*'
+            Resource:
+              - !Sub '${UsersBucket.Arn}/*'
+          - Sid: UseSecretsManager
+            Effect: Allow
+            Action: 
+              - 'secretsmanager:CreateSecret'
+              - 'secretsmanager:PutSecretValue'
+              - 'secretsmanager:UpdateSecret'
+              - 'secretsmanager:TagResource'
+            Resource: !Sub  'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:*'
+          - Sid: GetSecrets
+            Effect: Allow
+            Action: 
+              - 'secretsmanager:GetSecretValue'
+            Resource: !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:ws.users.*'
+          - Sid: GetADSecret
+            Effect: Allow
+            Action:
+              - 'secretsmanager:GetSecretValue'
+            Resource: !Ref wsADSecret
+          - Sid: SecretsManagerGlobalRequired
+            Effect: Allow
+            Action:
+              - 'secretsmanager:ListSecrets'
+              - 'secretsmanager:GetRandomPassword'
+            Resource: '*'
+      Roles:
+        - !Ref AdMgtServerRole
+
+# Create the EC2 Instance Profile to be used by the AD Management Server
+  InstanceProfileAdMgt:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: InstanceProfileADManagement
+      Path: /
+      Roles:
+        - !Ref AdMgtServerRole
+
+#Create the workspaces_DefaultRole - required for Workspace Directory registration
+  WorkspacesDefaultRole:
+    Type: AWS::IAM::Role
+    Condition: CreateWSDefaultRole
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - workspaces.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Description: Workspaces-Default-Role 
+      ManagedPolicyArns:
+      - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonWorkSpacesServiceAccess
+      - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonWorkSpacesSelfServiceAccess
+      RoleName: workspaces_DefaultRole #Do not customize.  This specific name is required.
+
+# Create Lambda function to register Managed AD/AD Connector with Workspaces
+  RegisterDirectory:
+    Type: AWS::Lambda::Function
+    Condition: CreateDirectoryRegistration
+    DependsOn: WorkspacesDefaultRole
+    Properties:
+      Code:
+        ZipFile: |
+          import logging
+          import boto3
+          import json
+          import cfnresponse as cfn
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          workspaces = boto3.client('workspaces')
+          def lambda_handler(event, context):
+            DirectoryId = event['ResourceProperties']['Directory_Id']
+            SubnetId1 = event['ResourceProperties']['Subnet_Id1']
+            SubnetId2 = event['ResourceProperties']['Subnet_Id2']
+            try:
+              response = workspaces.register_workspace_directory(DirectoryId=DirectoryId,SubnetIds=[SubnetId1,SubnetId2],EnableWorkDocs=False,EnableSelfService=False)
+              print('Successfully Registered Directory')
+              cfn.send(event, context, cfn.SUCCESS, {"Message": "Directory Registration successful!"})
+              logger.info('SUCCESS!')
+            except Exception as e:
+              print("Error: " + str(e))
+              logger.info('FAILED! - Exception during Directory Registration')
+              cfn.send(event, context, cfn.FAILED, {"Message": "Directory Registration NOT successful!"})
+            return
+      Role: !GetAtt RegistrationExecutionRole.Arn
+      Description: Register Managed AD with Workspaces
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      Timeout: 90
+      FunctionName: 'WorkspaceRegistration'
+
+# Create IAM Role for Lambda function to register Managed AD/AD Connector with Workspaces
+  RegistrationExecutionRole:
+    Type: AWS::IAM::Role
+    Condition: CreateDirectoryRegistration
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Description: Role for Lambda Execution of Workspace Directory Registration
+      RoleName: 'WorkspaceRegistrationExecutionRole'
+      ManagedPolicyArns:
+      - !Sub arn:${AWS::Partition}:iam::aws:policy/AWSDirectoryServiceFullAccess
+      Policies:
+        - PolicyName: DirectoryRegistration
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - workspaces:RegisterWorkspaceDirectory
+                  - iam:GetRole
+                  - ec2:Describe*
+                  - workdocs:RegisterDirectory
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                Resource: !Sub arn:${AWS::Partition}:logs:region:account-id:* 
+
+# Invoke the Lambda function to register Managed AD/AD Connector with Workspaces
+  RegisterDirectoryInvoke:
+    Type: Custom::RegisterDirectory
+    Condition: CreateDirectoryRegistration
+    Properties:
+      ServiceToken: !GetAtt RegisterDirectory.Arn
+      FunctionName: 'WorkspaceRegistration'
+      Directory_Id: !Ref DirectoryID
+      Subnet_Id1: !Ref WorkspaceSubnetOne
+      Subnet_Id2: !Ref WorkspaceSubnetTwo
+
+
+
+# Create S3 bucket
+  UsersBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref UsersBucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true 
+      NotificationConfiguration:
+        LambdaConfigurations:
+        - Event: 's3:ObjectCreated:Put'
+          Function: !GetAtt LambdaCompare.Arn
+          Filter:
+            S3Key:
+              Rules:
+                -
+                  Name: prefix
+                  Value: workspaces-lifecycle
+                -
+                  Name: suffix
+                  Value: .csv
+    DependsOn:
+      - LambdaComparePermission
+
+# Create maintenance window role
+  MaintenanceWindowRole:
+      Type: AWS::IAM::Role
+      Properties:
+        RoleName: 'ws-automation-window-role'
+        AssumeRolePolicyDocument:
+          Version: 2012-10-17
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - ssm.amazonaws.com
+              Action:
+                - sts:AssumeRole
+        Path: /
+        ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/service-role/AmazonSSMMaintenanceWindowRole
+        Policies:
+          - PolicyName: pass-role
+            PolicyDocument:
+              Version: 2012-10-17
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - iam:PassRole
+                  Resource:
+                    - 'arn:aws:ssm:region:account-id:*'
+                  Condition:
+                    StringEquals:
+                      'iam:PassedToService':
+                        - ssm.amazonaws.com
+
+# Create maintenance window
+  MaintenanceWindow:
+    Type: AWS::SSM::MaintenanceWindow
+    Properties:
+      Name: 'ws-automation-maintenance-window'
+      Schedule: 'cron(0 */15 * ? * *)'
+      Duration: 3
+      Cutoff: 1
+      AllowUnassociatedTargets: true
+    DependsOn:
+      - MaintenanceWindowRole
+      - UsersBucket
+
+# Create maintenance window task
+  MaintenanceWindowTask:
+    Type: AWS::SSM::MaintenanceWindowTask
+    Properties:
+      Name: 'ws-automation-maintenance-window-task'
+      WindowId: !Sub '${MaintenanceWindow}'
+      Targets:
+        - Key: InstanceIds
+          Values:
+          - !Ref AdInstanceID
+      TaskType: 'RUN_COMMAND'
+      ServiceRoleArn: !GetAtt MaintenanceWindowRole.Arn
+      TaskArn: 'AWS-RunPowerShellScript'
+      TaskInvocationParameters:
+        MaintenanceWindowRunCommandParameters:
+          Parameters:
+            commands:
+            - !Sub |
+              # Install tools if not already setup
+              if (!(Test-ComputerSecureChannel)) {
+                write-Output "Server is not domain joined - cannot proceed - exiting"
+                return
+              }
+              else {
+                if ((Get-WindowsOptionalFeature -FeatureName RSAT-ADDS-Tools -Online).State -eq "Enabled") {
+                  write-Output "tools already installed"
+                }
+                else {
+                  Import-Module ServerManager
+                  Add-WindowsFeature RSAT-ADDS-Tools
+                  Add-WindowsFeature  RSAT-AD-PowerShell
+                  import-module ActiveDirectory
+                  import-module AWSPowerShell
+                }
+              }
+
+              # Begin workspace creation automation
+              $workspaceUsersOU="OU=WorkspaceUsers,${DomainOUPath}"
+              $bucket = "${UsersBucketName}"
+              $wslocalPath = '${DriveLetter}:\workspaces-users\'
+
+              if (Test-Path -Path $wslocalPath) { Write-Output "Path Exists" } 
+              else {
+                  write-Output "Creating  $wslocalPath"
+                  New-Item -Path $wslocalPath -ItemType directory -ErrorAction Stop -ErrorVariable +ErrVar
+              }
+
+              Get-ADUser -Filter * -SearchBase $workspaceUsersOU -Properties SamAccountname | % {New-Object PSObject -Property @{oSamAccountname= $_.SamAccountname}} | select-object oSamAccountname | export-CSV ${DriveLetter}:\\workspaces-users\\workspaces-users1.csv -NoTypeInformation -Encoding UTF8
+              Get-Content ${DriveLetter}:\\workspaces-users\\workspaces-users1.csv | Select-Object -Skip 1 | Set-Content ${DriveLetter}:\\workspaces-users\\workspaces-users.csv
+              Write-S3Object -BucketName $bucket -Key workspaces-lifecycle/workspaces-users.csv -File ${DriveLetter}:\\workspaces-users\\workspaces-users.csv
+              # End workspace creation automation
+
+              # Begin user lifecycle automation
+              $prefix = "userlifecycle/UserList.csv"
+              $key = "UserList.csv"
+              $template = "userlifecycle/UserListTemplate.csv"
+
+              $BaseDN="${DomainOUPath}"
+
+              $localPath = '${DriveLetter}:\lifecycle-users\'
+              $localFileName = $localPath + 'New' + $key
+              $oldhashfile = $localPath + 'Old' + $key
+              
+              $newUserFile = $localPath + $key
+
+              if (Test-Path -Path $localPath) { Write-Output "Path Exists" } 
+              else {
+                  write-Output "Creating  $localPath"
+                  New-Item -Path $localPath -ItemType directory -ErrorAction Stop -ErrorVariable +ErrVar
+                }
+              try {
+                  $metadata = Get-S3ObjectMetadata -BucketName $bucket -Key $prefix 
+                  write-Output "UserList.csv Found, Processing File..."
+              }
+              catch { 
+                write-Output "UserList.csv File not found in S3 $bucket, Creating Template File.."
+                Set-Content -Path $newUserFile -Value "Accountstatus,UserName,FirstName,LastName,Email,Company"
+                Write-S3Object -bucketname $bucket -File $newUserFile -key $template
+                Remove-Item $newUserFile
+                return
+                }
+              Copy-S3Object -LocalFile $localFileName -BucketName $bucket -Key $prefix
+              # write-Output "Downloaded UserList.csv to $localFileName"
+
+              # Compare the file hash with the last version of downloaded file and only Process if they are different.
+              $hashSrc = Get-FileHash $localFileName -Algorithm "SHA256"
+              if (Test-Path -Path $oldhashfile ) {
+              $hashDest = Get-FileHash $oldhashfile -Algorithm "SHA256"
+              }
+
+              # Compare the hashes & note this in the log
+              If  ($hashSrc.Hash -eq $hashDest.Hash)
+              {
+                write-Output  "File Contents Unchanged"
+                return
+              }
+
+              # Store the data from NewUsersList.csv in the $ADUsers variable
+
+              $ADUsers = Import-Csv $localFileName -Delimiter ","
+
+              $admin_user = Get-SECSecretValue -SecretId "${wsADSecret}" -Select SecretString | ConvertFrom-Json | Select-object -ExpandProperty username	 -ErrorAction Stop -ErrorVariable +ErrVar
+              $password = Get-SECSecretValue -SecretId "${wsADSecret}" -Select SecretString | ConvertFrom-Json | Select-object -ExpandProperty password	 -ErrorAction Stop -ErrorVariable +ErrVar
+              $spassword = ConvertTo-SecureString -String $password -AsPlainText -Force
+              $cred = New-Object System.Management.Automation.PSCredential ($admin_user,$spassword)
+
+                  
+              if (Get-ADOrganizationalUnit -Filter "Name -eq 'WorkspaceUsers'") {
+                Write-Output("OU WorkspaceUsers already exists")
+              }
+              else #OU workspaces does not exist so create
+                {
+                Write-Output("OU Workspace Users Does Not exist - Creating ... ")
+                New-ADOrganizationalUnit -Name "WorkspaceUsers" -Path $BaseDN -Credential $cred -ErrorAction Stop -ErrorVariable +ErrVar
+                }
+
+
+              # Loop through each row containing user details in the CSV file
+              foreach ($User in $ADUsers) {
+                  #Read user data from each field in each row and assign the data to a variable as below
+                  $status = $User.accountstatus
+                  $username = $User.username
+                  $firstname = $User.firstname
+                  $lastname = $User.lastname
+                  $email = $User.email
+                  $company = $User.company
+
+                  # Check to see if the user already exists in AD
+                  if ($status -eq "A") {
+                      if (Get-ADUser -F { SamAccountName -eq $username }) {     
+                          # If user does exist, give a warning
+                          Write-Warning "A user account with username $username already exists in Active Directory."
+                  }
+                  else {	
+                      # User does not exist then proceed to create the new user account	
+                    try{
+                      Write-Output "Creating AD account for user: $username" 
+                      #create random password for user 
+                      $userpassword=Get-SecRandomPassword -ErrorAction Stop -ErrorVariable +ErrVar
+                      $secretId = "ws.users." + $username
+                      Write-Output "secret ID: $secretId" 
+
+                      #create new secret for user
+                      $TagObject = New-Object Amazon.SecretsManager.Model.Tag -Property @{Key="UserId";Value=$username}
+                    
+                      Write-Output "Creating User Secret for user $username "
+                      New-SECSecret -Name $secretId -SecretString $userpassword -Description "AD User Account Details" -Tag $TagObject -ErrorAction Stop -ErrorVariable +ErrVar
+                    Write-Output "Created New Secret for : $secretId " 
+                  }
+                  Catch{
+                    Write-Error "Error creating Secret for User: $username $_.InvocationInfo.MyCommand.Name $_.ErrorDetails.Message $_.CategoryInfo.ToString()" 
+                            }	 
+
+                  #get The password for the user from Secrects Manager and use it to create Account
+                  $pw = get-SecSecretvalue -secretId $secretId -ErrorAction Stop -ErrorVariable +ErrVar
+                  
+                      try {
+                  New-ADUser `
+                  -Credential $cred `
+                            -SamAccountName $username `
+                            -Name "$firstname $lastname" `
+                            -GivenName $firstname `
+                            -Surname $lastname `
+                            -Description "User $username - Auto Created by AWS AD UserManagement Process" `
+                            -Enabled $True `
+                            -DisplayName "$lastname, $firstname" `
+                            -Path $workspaceUsersOU `
+                            -Company $company `
+                            -EmailAddress $email `
+                            -AccountPassword (ConvertTo-secureString $pw.secretstring -AsPlainText -Force) -ChangePasswordAtLogon $False `
+                  -ErrorAction Stop -ErrorVariable +ErrVar
+                    }
+                Catch{
+                  Write-Error "Error creating username $username $_.InvocationInfo.MyCommand.Name $_.ErrorDetails.Message $_.CategoryInfo.ToString() "
+                        }
+                }  #User does not exist 
+              } # if status A block
+              else {  #status = 'Deactivate'	
+                  $inactiveOU=Get-ADOrganizationalUnit -Filter "Name -eq 'InactiveWSUsers'" | select-Object distinguishedName
+                        if($InactiveOU)   #Disabled OU exists
+                        { 
+                      $userEnabled = Get-ADUser -Filter {samaccountname -eq $username} | select-Object Enabled
+                      if ($userEnabled.enabled -eq $true) {
+                        try {
+                          Get-ADUser -F { SamAccountName -eq $username } | Disable-ADAccount -credential $cred -ErrorAction Stop -ErrorVariable +ErrVar
+                          Get-ADUser -F { SamAccountName -eq $username } | Move-ADObject -TargetPath  $InactiveOU.DistinguishedName -credential $cred -ErrorAction Stop -ErrorVariable +ErrVar
+                        }
+                        Catch{
+                          Write-Error "Error Disabling User $username in Active Directory$_.InvocationInfo.MyCommand.Name $_.ErrorDetails.Message $_.CategoryInfo.ToString() "
+                                  }
+                      }
+                      else {
+                        Write-Warning "User $username is already Disabled"
+                      }
+                        }
+                    else # Inactive Users group does not exist
+                        {	#Create New AD group for Inactive accounts similar to the Users group and move the account there
+                      try {
+                        Write-Output "Creating New OU for Inactive Users"
+                        New-ADOrganizationalUnit -Name "InactiveWSUsers" -Path $BaseDN -Credential $cred -ErrorAction Stop -ErrorVariable +ErrVar
+                        $inactiveOU=Get-ADOrganizationalUnit -Filter "Name -eq 'InactiveWSUsers'" | select-Object distinguishedName
+                        Write-Output "Disabling User $username"
+                        Get-ADUser -F { SamAccountName -eq $username }  | Disable-ADAccount -credential $cred
+                        Get-ADUser -F { SamAccountName -eq $username } | Move-ADObject -TargetPath  $InactiveOU.DistinguishedName -credential $cred -ErrorAction Stop -ErrorVariable +ErrVar
+                                  
+                      }
+                      Catch{
+                        Write-Error "Error Creating Inactive OU /disabling $username in Active Directory$_.InvocationInfo.MyCommand.Name $_.ErrorDetails.Message $_.CategoryInfo.ToString() "
+                                }			
+                          }
+              }
+              }
+
+              #If process ran successfully - Rename the file to "old"
+              If ($ErrVar) {
+                write-Output "Errors occured during processing of File - Exiting with Error Status"
+                }
+              else {
+                write-Output "Successfully Processed File"
+                #Move the processed file to the archive folder
+                $processedFileName = "userlifecycle/archive/" + [system.io.path]::GetFileNameWithoutExtension($key)+ "processed" + [DateTime]::Now.ToString("yyyyMMddHHmmss") + ".csv"
+                Write-S3Object -bucketname $bucket -File $LocalFileName -key $processedFileName
+                #Now rename the LocalFile
+                Move-Item -Path $LocalFileName -Destination $oldhashfile -Force  
+                }
+              #Return Success
+              Return
+           
+            workingDirectory:
+            - ""
+            executionTimeout:
+            - "600"
+           
+      MaxConcurrency: 1
+      MaxErrors: 1
+      Priority: 10
+    DependsOn:
+      - MaintenanceWindow
+
+# Create role for Lambda compare function
+  LambdaCompareRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: 'ws-automation-lambda-compare-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          -
+            Effect: 'Allow'
+            Principal:
+              Service:
+                - 'lambda.amazonaws.com'
+            Action:
+              - 'sts:AssumeRole'
+
+# Create policy and attaches to the role for Lambda compare function
+  LambdaCompareRolePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: 'ws-automation-lambda-compare-role-policy'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          -
+            Effect: 'Allow'
+            Action:
+              - 'logs:CreateLogGroup'
+              - 'logs:CreateLogStream'
+              - 'logs:PutLogEvents'
+              - 'workspaces:CreateWorkspaces'
+              - 'workspaces:TerminateWorkspaces'
+              - 'workspaces:DescribeWorkspaces'
+            Resource: '*'
+          -
+            Effect: 'Allow'
+            Action:
+              - 's3:PutObject'
+              - 's3:GetObject'
+            Resource: !Sub '${UsersBucket.Arn}/*'
+      Roles:
+        - !Ref LambdaCompareRole
+
+# Create Lambda compare function
+  LambdaCompare:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: 'ws-automation-lambda-compare'
+      Handler: 'index.lambda_handler'
+      Role: !Sub '${LambdaCompareRole.Arn}'
+      Code:
+        ZipFile:
+          |
+            import csv
+            import logging
+            import os
+            import boto3
+            s3_client = boto3.client('s3')
+            ws_client = boto3.client('workspaces')
+            DIRECTORY_ID = os.getenv('DIRECTORY_ID')
+            BUNDLE_ID = os.getenv('BUNDLE_ID',)
+            RUNNING_MODE = 'AUTO_STOP'
+            logging.basicConfig(format='%(asctime)s [%(levelname)+8s]%(module)s: %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+            logger = logging.getLogger(__name__)
+            logger.setLevel(getattr(logging, os.getenv('LOG_LEVEL', 'INFO')))
+            # --- Main handler ---
+            def lambda_handler(event, context):
+                bucket = event['Records'][0]['s3']['bucket']['name']
+                key = event['Records'][0]['s3']['object']['key']
+                # Get CSV file from S3 and transform it into JSON
+                csv_object = s3_client.get_object(Bucket=bucket, Key=key)
+                csv_users = csv.reader(csv_object['Body'].read().decode('utf-8').splitlines())
+                ad_users = set()
+                for item in csv_users:
+                    if item:
+                        logger.debug('Adding user: {}'.format(item[0]))
+                        ad_users.add(item[0])
+                # Get current workspaces
+                response = ws_client.describe_workspaces()
+                workspaces = response['Workspaces']
+                current_ws = set()
+                for workspace in workspaces:
+                    current_ws.add(workspace['UserName'])
+                # If user is present in Ad user list but not in WorkSpaces list, terminate WorkSpace
+                users_to_add = ad_users - current_ws
+                logger.debug('Users to add: {}'.format(users_to_add))
+                for user in users_to_add:
+                    try:
+                        logger.info('Creating Workspaces for user: {}'.format(user))
+                        create_ws = ws_client.create_workspaces(
+                            Workspaces=[
+                                {
+                                    'DirectoryId': DIRECTORY_ID,
+                                    'UserName': user,
+                                    'BundleId': BUNDLE_ID,
+                                    'WorkspaceProperties': {
+                                        'RunningMode': RUNNING_MODE,
+                                        'RunningModeAutoStopTimeoutInMinutes': 60,
+                                        'RootVolumeSizeGib': 80,
+                                        'UserVolumeSizeGib': 50,
+                                        'ComputeTypeName': 'STANDARD'
+                                    }
+                                }
+                            ]
+                        )
+                    except Exception as e:
+                        logger.error('Unable to Create Workspaces')
+                        logger.debug('Error: {}'.format(e))
+                # If user is present in WorkSpaces list but not in AD user list, terminate WorkSpace
+                ws_to_terminate = current_ws - ad_users
+                logger.debug('Workspaces to terminate: {}'.format(ws_to_terminate))
+                for user in ws_to_terminate:
+                    try:
+                        logger.info('Terminating Workspaces for user: {}'.format(user))
+                        describe_ws = ws_client.describe_workspaces(DirectoryId=DIRECTORY_ID)
+                        for workspace in describe_ws['Workspaces']:
+                            if workspace['UserName'] == user:
+                                workspace_id = workspace['WorkspaceId']
+                                terminate_ws = ws_client.terminate_workspaces(
+                            TerminateWorkspaceRequests=[
+                                {
+                                    'WorkspaceId': workspace_id
+                                },
+                            ])
+                    except Exception as e:
+                        logger.error('Error executing describe_workspaces or terminate_workspaces')
+                        logger.debug('Error: {}'.format(e))
+
+      Runtime: 'python3.9'
+      Timeout: 600
+      Environment:
+        Variables:
+          DIRECTORY_ID: !Ref DirectoryID
+          BUNDLE_ID: !Ref BundleID
+
+# Creates the Lambda Compare function permission for the S3 bucket
+  LambdaComparePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LambdaCompare
+      Action: 'lambda:InvokeFunction'
+      Principal: 's3.amazonaws.com'
+      SourceAccount: !Ref 'AWS::AccountId'
+      SourceArn: !Sub 'arn:${AWS::Partition}:s3:::${UsersBucketName}'
+
+# Resource Outputs
+Outputs:
+
+  StackName:
+    Description: Stack name.
+    Value: !Sub '${AWS::StackName}'
+
+  UsersBucket:
+    Description: S3 bucket name.
+    Value: !Ref UsersBucket
+
+  MaintenanceWindowRole:
+    Description: Maintenance Window Role name.
+    Value: !Ref MaintenanceWindowRole
+
+  MaintenanceWindow:
+    Description: Systems Manager Maintenance Window ID.
+    Value: !Ref MaintenanceWindow
+
+  MaintenanceWindowTask:
+    Description: Maintenance Window Task ID.
+    Value: !Ref MaintenanceWindowTask
+
+  LambdaCompareRole:
+    Description: Lambda Compare Role name.
+    Value: !Ref LambdaCompareRole
+
+  LambdaCompareRolePolicy:
+    Description: Lambda Compare Policy ID.
+    Value: !Ref LambdaCompareRolePolicy
+
+  LambdaCompare:
+    Description: Lambda Compare function name.
+    Value: !Ref LambdaCompare
